@@ -10,18 +10,15 @@ import chokidar from 'chokidar';
 import { MSG, PROTOCOL_VERSION } from './protocol.js';
 import { buildManifest, hashFile, toAbs, reconcilePlan } from './manifest.js';
 import { sendFile, TransferReceiver } from './transfer.js';
-import { isIgnored, TEMP_SUFFIX } from './ignore.js';
+import { isIgnored } from './ignore.js';
 import { loadState, saveState } from './state.js';
-import { DeleteSuppressor } from './suppress.js';
+import { EchoSuppressor } from './echo-suppress.js';
+import { LiveRenameDetector } from './live-rename.js';
+import { DirSync } from './dir-sync.js';
+import { isSafeRel } from './path-safety.js';
 import { moveToTrash, pruneTrash } from './trash.js';
 import { detectCaseCollisions, normalizeRel } from './normalize.js';
-import { signature, diff, apply } from './delta.js';
-import { newTransferId } from './transfer.js';
-import crypto from 'node:crypto';
-
-const DELTA_MIN = 256 * 1024;        // só vale a pena delta acima disto
-const DELTA_MAX = 64 * 1024 * 1024;  // acima disto, transfere cheio (memória)
-const DELTA_BLOCK = 4096;
+import { DeltaTransport, DELTA_MIN, DELTA_MAX } from './delta-transport.js';
 
 // Reescreve as chaves de um objeto rel->valor para a forma canônica NFC.
 // Usado nos manifestos/tombstones recebidos do peer para que NFC e NFD do mesmo
@@ -30,15 +27,6 @@ function normalizeKeys(obj) {
   const out = {};
   for (const k of Object.keys(obj)) out[normalizeRel(k)] = obj[k];
   return out;
-}
-
-// Garante (LEXICAMENTE) que um caminho relativo recebido do peer não escapa da
-// pasta raiz. É só a primeira barreira: não enxerga symlinks (ver isSafeTarget).
-function isSafeRel(dir, rel) {
-  if (!rel || rel.includes('\0')) return false;
-  const abs = path.resolve(dir, rel.split('/').join(path.sep));
-  const root = path.resolve(dir);
-  return abs === root || abs.startsWith(root + path.sep);
 }
 
 export class SyncEngine {
@@ -57,17 +45,33 @@ export class SyncEngine {
     this.receiver = null;
     this.watcher = null;
     this.saveTimer = null;
-    // Anti-eco: rel -> Set(hashes esperados de escritas vindas do peer).
-    this.suppressAdd = new Map();
-    this.suppressDelete = new DeleteSuppressor();
-    // Diretórios (para sincronizar pastas vazias) e anti-eco de mkdir/rmdir.
-    this.dirs = new Set();
-    this.suppressDirAdd = new Set();
-    this.suppressDirDel = new Set();
-    // Detecção de rename ao vivo: hash -> { rel, timer } de unlinks recentes.
-    this.recentUnlinks = new Map();
-    // Delta sync: transferId -> resolver aguardando a assinatura (SIG) do peer.
-    this.pendingSig = new Map();
+    // Anti-eco centralizado: escritas (suppressAdd), deleções (DeleteSuppressor)
+    // e mkdir/rmdir de diretórios. Ver echo-suppress.js.
+    this.echo = new EchoSuppressor();
+    // Diretórios (pastas vazias): estado + mkdir/rmdir local/remoto. Ver dir-sync.js.
+    // O send é resolvido na hora (a conexão pode trocar): só emite se o ws atual
+    // estiver aberto — mesma condição do código original.
+    this.dirSync = new DirSync({
+      dir: this.dir,
+      ig: this.ig,
+      echo: this.echo,
+      isSafeTarget: (rel) => this.isSafeTarget(rel),
+      send: (msg) => { if (this.ws && this.ws.readyState === this.ws.OPEN) this.ws.send(JSON.stringify(msg)); },
+      log: this.log,
+    });
+    // Detecção de rename ao vivo (unlink+add com mesmo hash+size). Ver live-rename.js.
+    this.liveRename = new LiveRenameDetector();
+    // Transporte delta (rsync). A DECISÃO de usar delta (allowDelta) fica aqui no
+    // pushFile; o módulo só executa. Ver delta-transport.js.
+    this.delta = new DeltaTransport({
+      dir: this.dir,
+      log: this.log,
+      getWs: () => this.ws,
+      rejectReason: (rel) => this.rejectReason(rel),
+      expectWrite: (rel, hash) => this.expectWrite(rel, hash),
+      onRemoteFileWritten: (rel, meta) => this.onRemoteFileWritten(rel, meta),
+      onWork: () => { this.announced = false; },
+    });
   }
 
   async start() {
@@ -86,7 +90,7 @@ export class SyncEngine {
       checksum: this.checksum,
       log: this.log,
     });
-    this.dirs = await this.scanDirs();
+    this.dirSync.setDirs(await this.dirSync.scanDirs());
 
     // Deleção OFFLINE: arquivo que estava no estado salvo e agora sumiu (e não
     // virou ignorado) foi apagado com o app fechado -> vira tombstone para
@@ -140,27 +144,8 @@ export class SyncEngine {
     this.watcher.on('add', (p) => this.onLocalUpsert(p));
     this.watcher.on('change', (p) => this.onLocalUpsert(p));
     this.watcher.on('unlink', (p) => this.onLocalUnlink(p));
-    this.watcher.on('addDir', (p) => this.onLocalAddDir(p));
-    this.watcher.on('unlinkDir', (p) => this.onLocalRmDir(p));
-  }
-
-  // Varre os diretórios (inclusive vazios) respeitando os ignores.
-  async scanDirs() {
-    const out = new Set();
-    const walk = async (cur) => {
-      let entries;
-      try { entries = await fsp.readdir(cur, { withFileTypes: true }); } catch { return; }
-      for (const e of entries) {
-        if (!e.isDirectory()) continue;
-        const abs = path.join(cur, e.name);
-        const rel = normalizeRel(path.relative(this.dir, abs).split(path.sep).join('/')); // chave NFC (ver manifest.js)
-        if (isIgnored(this.ig, rel + '/') || isIgnored(this.ig, rel)) continue;
-        out.add(rel);
-        await walk(abs);
-      }
-    };
-    await walk(this.dir);
-    return out;
+    this.watcher.on('addDir', (p) => this.dirSync.onLocalAddDir(p));
+    this.watcher.on('unlinkDir', (p) => this.dirSync.onLocalRmDir(p));
   }
 
   attach(ws) {
@@ -170,14 +155,14 @@ export class SyncEngine {
     this.receiver = new TransferReceiver(this.dir, {
       onComplete: (rel, meta) => this.onRemoteFileWritten(rel, meta),
       onReject: (rel, motivo) => {
-        this.suppressAdd.delete(rel); // libera a supressão de um eco que não virá
+        this.echo.cancelWrite(rel); // libera a supressão de um eco que não virá
         this.log(`recebimento rejeitado (${rel}): ${motivo}`);
       },
       log: this.log,
     });
 
     ws.send(JSON.stringify({ type: MSG.HELLO, version: PROTOCOL_VERSION, isHost: this.isHost, time: Date.now() }));
-    ws.send(JSON.stringify({ type: MSG.MANIFEST, files: this.manifest, tombstones: this.tombstones, dirs: [...this.dirs] }));
+    ws.send(JSON.stringify({ type: MSG.MANIFEST, files: this.manifest, tombstones: this.tombstones, dirs: [...this.dirSync.dirs] }));
 
     // Fila serial: garante que FILE_BEGIN seja totalmente processado antes dos
     // chunks que o seguem, e aplica backpressure (await da escrita) na ordem.
@@ -203,8 +188,7 @@ export class SyncEngine {
     // Só limpa se o ws que fechou ainda é o ativo (evita anular reconexão nova).
     if (ws && ws !== this.ws) return;
     if (this.receiver) await this.receiver.cleanup();
-    for (const [, p] of this.pendingSig) { clearTimeout(p.timer); p.resolve(null); }
-    this.pendingSig.clear();
+    this.delta.cancelPending();
     this.receiver = null;
     this.ws = null;
     this.peerManifest = null;
@@ -231,28 +215,26 @@ export class SyncEngine {
         // arquivo, mesmo que o peer ainda não normalize.
         this.peerManifest = normalizeKeys(msg.files || {});
         this.peerTombstones = normalizeKeys(msg.tombstones || {});
-        await this.reconcileDirs(msg.dirs || []);
+        await this.dirSync.reconcileDirs(msg.dirs || []);
         await this.reconcile();
         break;
       case MSG.MKDIR:
-        await this.applyRemoteMkdir(msg.rel);
+        await this.dirSync.applyRemoteMkdir(msg.rel);
         break;
       case MSG.RMDIR:
-        await this.applyRemoteRmdir(msg.rel);
+        await this.dirSync.applyRemoteRmdir(msg.rel);
         break;
       case MSG.RENAME:
         await this.applyRemoteRename(msg.from, msg.to);
         break;
       case MSG.DELTA_REQ:
-        await this.handleDeltaReq(msg);
+        await this.delta.handleDeltaReq(msg);
         break;
-      case MSG.SIG: {
-        const p = this.pendingSig.get(msg.transferId);
-        if (p) { this.pendingSig.delete(msg.transferId); clearTimeout(p.timer); p.resolve(msg.has ? msg : null); }
+      case MSG.SIG:
+        this.delta.resolveSig(msg);
         break;
-      }
       case MSG.DELTA:
-        await this.applyDelta(msg);
+        await this.delta.applyDelta(msg);
         break;
       case MSG.FILE_BEGIN: {
         // Chave lógica em NFC (ver manifest.js): normaliza o rel ANTES de validar,
@@ -368,7 +350,7 @@ export class SyncEngine {
       const canDelta = allowDelta && peerOld && peerOld.hash !== meta.hash &&
         meta.size >= DELTA_MIN && meta.size <= DELTA_MAX;
       let sent = false;
-      if (canDelta) sent = await this.pushDelta(rel, meta, ws);
+      if (canDelta) sent = await this.delta.pushDelta(rel, meta, ws);
       if (!sent) await sendFile(ws, toAbs(this.dir, rel), rel, meta);
       if (this.peerManifest && this.ws === ws) this.peerManifest[rel] = meta; // peer tem esta versão
     } catch (e) {
@@ -379,75 +361,8 @@ export class SyncEngine {
     }
   }
 
-  // Envia só os blocos que mudaram (rsync). Retorna false para cair no envio
-  // completo (peer não tem versão antiga, delta não compensou, ou timeout).
-  async pushDelta(rel, meta, ws) {
-    if (!ws || ws.readyState !== ws.OPEN) return false;
-    const transferId = newTransferId();
-    const sig = await new Promise((resolve) => {
-      const timer = setTimeout(() => { this.pendingSig.delete(transferId); resolve(null); }, 30000);
-      if (timer.unref) timer.unref();
-      this.pendingSig.set(transferId, { resolve, timer });
-      ws.send(JSON.stringify({ type: MSG.DELTA_REQ, transferId, rel }));
-    });
-    if (!sig || !sig.sig) return false; // peer não tem o arquivo antigo (ou caiu)
-    if (this.ws !== ws || ws.readyState !== ws.OPEN) return false; // conexão trocou
-    let buf;
-    try { buf = await fsp.readFile(toAbs(this.dir, rel)); } catch { return false; }
-    const ops = diff(sig.sig, buf, sig.blockSize);
-    let literal = 0;
-    for (const op of ops) if (op.data) literal += op.data.length;
-    if (literal > buf.length * 0.8) return false; // delta não compensa: envia cheio
-    const wire = ops.map((op) => (op.data ? { d: op.data.toString('base64') } : { c: op.copy }));
-    ws.send(JSON.stringify({
-      type: MSG.DELTA, rel, hash: meta.hash, size: meta.size, mtimeMs: meta.mtimeMs,
-      blockSize: sig.blockSize, ops: wire,
-    }));
-    this.log(`delta ${rel}: ${(literal / 1024).toFixed(0)} KB de ${(buf.length / 1024).toFixed(0)} KB`);
-    return true;
-  }
-
-  // Peer pediu a assinatura do nosso arquivo antigo (para nos mandar um delta).
-  async handleDeltaReq(msg) {
-    msg.rel = normalizeRel(msg.rel); // chave lógica em NFC (ver manifest.js)
-    if (!isSafeRel(this.dir, msg.rel)) { this.ws.send(JSON.stringify({ type: MSG.SIG, transferId: msg.transferId, has: false })); return; }
-    let buf;
-    try { buf = await fsp.readFile(toAbs(this.dir, msg.rel)); } catch {
-      this.ws.send(JSON.stringify({ type: MSG.SIG, transferId: msg.transferId, has: false }));
-      return;
-    }
-    const sig = signature(buf, DELTA_BLOCK);
-    this.ws.send(JSON.stringify({ type: MSG.SIG, transferId: msg.transferId, has: true, blockSize: DELTA_BLOCK, sig }));
-  }
-
-  // Recebe um delta: reconstrói o arquivo a partir do antigo + ops e valida hash.
-  async applyDelta(msg) {
-    msg.rel = normalizeRel(msg.rel); // chave lógica em NFC (ver manifest.js)
-    const motivo = await this.rejectReason(msg.rel);
-    if (motivo) { this.log(`delta recusado (${motivo}): ${msg.rel}`); return; }
-    let oldBuf;
-    try { oldBuf = await fsp.readFile(toAbs(this.dir, msg.rel)); } catch { oldBuf = Buffer.alloc(0); }
-    const ops = msg.ops.map((o) => (o.d !== undefined ? { data: Buffer.from(o.d, 'base64') } : { copy: o.c }));
-    let newBuf;
-    try { newBuf = apply(oldBuf, ops, msg.blockSize); } catch (e) { this.log(`delta falhou em ${msg.rel}: ${e.message}`); return; }
-    // Integridade: o resultado tem que bater com o hash/tamanho anunciados.
-    const digest = crypto.createHash('sha256').update(newBuf).digest('hex');
-    if (digest !== msg.hash || newBuf.length !== msg.size) {
-      this.log(`delta inválido em ${msg.rel} (hash/tamanho) — será re-sincronizado`);
-      return;
-    }
-    this.announced = false;
-    this.expectWrite(msg.rel, msg.hash);
-    const abs = toAbs(this.dir, msg.rel);
-    const tmp = abs + '.delta' + TEMP_SUFFIX;
-    await fsp.mkdir(path.dirname(abs), { recursive: true });
-    await fsp.writeFile(tmp, newBuf);
-    await moveToTrash(this.dir, msg.rel).catch(() => {});
-    await fsp.rename(tmp, abs);
-    const mtime = new Date(msg.mtimeMs);
-    await fsp.utimes(abs, mtime, mtime).catch(() => {});
-    this.onRemoteFileWritten(msg.rel, { hash: msg.hash, size: msg.size, mtimeMs: msg.mtimeMs });
-  }
+  // pushDelta / handleDeltaReq / applyDelta + pendingSig ficam em DeltaTransport
+  // (ver delta-transport.js). O SyncEngine só decide allowDelta e delega.
 
   // Anuncia "em sincronia" quando não há nada em voo (uma vez por ciclo).
   maybeInSync() {
@@ -486,15 +401,10 @@ export class SyncEngine {
 
     // Reapareceu no MESMO caminho: cancela a deleção adiada (era um modify,
     // não um delete) para o finalizeDelete não apagar o arquivo recriado.
-    const samePath = this.recentUnlinks.get(rel);
-    if (samePath) { clearTimeout(samePath.timer); this.recentUnlinks.delete(rel); }
+    this.liveRename.cancelPending(rel);
 
-    // Eco de uma escrita que veio do peer? Consome e não reenvia.
-    // Limpa a entrada INTEIRA: o awaitWriteFinish coalesce escritas e só entrega
-    // o estado final, então hashes intermediários nunca disparariam evento.
-    const expected = this.suppressAdd.get(rel);
-    if (expected && expected.has(meta.hash)) {
-      this.suppressAdd.delete(rel);
+    // Eco de uma escrita que veio do peer? Consome e não reenvia (ver echo-suppress.js).
+    if (this.echo.consumeEcho(rel, meta.hash)) {
       this.manifest[rel] = meta;
       this.scheduleSave();
       return;
@@ -503,20 +413,17 @@ export class SyncEngine {
     // RENAME? Um unlink recente com o MESMO hash E TAMANHO = arquivo movido.
     // Exigir size também evita rename espúrio por colisão de hash entre arquivos
     // de identidades diferentes (que engoliria uma deleção real). Mandamos RENAME
-    // (mover no peer) em vez de retransferir o conteúdo.
-    for (const [oldRel, ent] of this.recentUnlinks) {
-      if (ent.hash === meta.hash && ent.size === meta.size) {
-        clearTimeout(ent.timer);
-        this.recentUnlinks.delete(oldRel);
-        this.manifest[rel] = meta;
-        this.scheduleSave();
-        if (this.peerManifest) { delete this.peerManifest[oldRel]; this.peerManifest[rel] = meta; }
-        this.log(`rename: ${oldRel} -> ${rel}`);
-        if (this.ws && this.ws.readyState === this.ws.OPEN) {
-          this.ws.send(JSON.stringify({ type: MSG.RENAME, from: oldRel, to: rel }));
-        }
-        return;
+    // (mover no peer) em vez de retransferir o conteúdo. Ver live-rename.js.
+    const oldRel = this.liveRename.tryMatch(rel, meta.hash, meta.size);
+    if (oldRel !== null) {
+      this.manifest[rel] = meta;
+      this.scheduleSave();
+      if (this.peerManifest) { delete this.peerManifest[oldRel]; this.peerManifest[rel] = meta; }
+      this.log(`rename: ${oldRel} -> ${rel}`);
+      if (this.ws && this.ws.readyState === this.ws.OPEN) {
+        this.ws.send(JSON.stringify({ type: MSG.RENAME, from: oldRel, to: rel }));
       }
+      return;
     }
 
     this.manifest[rel] = meta;
@@ -532,7 +439,7 @@ export class SyncEngine {
     // Chave lógica em NFC (ver manifest.js).
     const rel = normalizeRel(path.relative(this.dir, absPath).split(path.sep).join('/'));
     // Eco de uma deleção que veio do peer? Consome (contador) e não re-propaga.
-    if (this.suppressDelete.consume(rel)) {
+    if (this.echo.consumeDelete(rel)) {
       delete this.manifest[rel];
       this.scheduleSave();
       return;
@@ -545,19 +452,18 @@ export class SyncEngine {
     delete this.manifest[rel];
     this.scheduleSave();
     // Adia a propagação ~800ms para detectar rename (add com mesmo hash logo
-    // em seguida). Se nada aparecer, finaliza como deleção de verdade.
+    // em seguida). Se nada aparecer, finaliza como deleção de verdade. Sem hash
+    // (arquivo desconhecido) não há como casar rename: finaliza já. Ver live-rename.js.
     if (hash) {
-      const timer = setTimeout(() => this.finalizeDelete(rel), 800);
-      if (timer.unref) timer.unref();
-      this.recentUnlinks.set(rel, { hash, size, timer });
+      this.liveRename.registerUnlink(rel, hash, size, (r) => this.finalizeDelete(r));
     } else {
       this.finalizeDelete(rel);
     }
   }
 
   finalizeDelete(rel) {
-    const ent = this.recentUnlinks.get(rel);
-    if (ent) { clearTimeout(ent.timer); this.recentUnlinks.delete(rel); }
+    // A entrada em recentUnlinks (quando havia) já foi removida pelo detector ao
+    // vencer a janela; aqui só registramos o tombstone e propagamos o delete.
     const now = Date.now();
     this.tombstones[rel] = now; // sobrevive à desconexão e propaga
     this.scheduleSave();
@@ -566,22 +472,9 @@ export class SyncEngine {
 
   // ---- Aplicação de mudanças vindas do peer ----
 
-  // Registra que uma escrita com este hash virá do peer. SEM timeout aqui: uma
-  // transferência grande pode demorar, e expirar no meio causaria loop de eco.
-  // O timeout de segurança é armado só quando o arquivo aterrissa (rename).
-  expectWrite(rel, hash) {
-    if (!this.suppressAdd.has(rel)) this.suppressAdd.set(rel, new Set());
-    this.suppressAdd.get(rel).add(hash);
-  }
-
-  clearSuppressLater(rel, hash) {
-    // Rede de segurança: se o watcher nunca disparar (ex: conteúdo idêntico),
-    // limpa após 10s contados do momento em que o arquivo já está no disco.
-    setTimeout(() => {
-      const set = this.suppressAdd.get(rel);
-      if (set) { set.delete(hash); if (set.size === 0) this.suppressAdd.delete(rel); }
-    }, 10000);
-  }
+  // Anti-eco de escritas: delega ao EchoSuppressor (ver echo-suppress.js).
+  expectWrite(rel, hash) { this.echo.expectWrite(rel, hash); }
+  clearSuppressLater(rel, hash) { this.echo.clearSuppressLater(rel, hash); }
 
   onRemoteFileWritten(rel, meta) {
     // Arquivo do peer já gravado e validado (hash conferido em transfer.js).
@@ -627,7 +520,7 @@ export class SyncEngine {
     let existed = false;
     try { await fsp.access(abs); existed = true; } catch { /* não existe */ }
     if (existed) {
-      this.suppressDelete.expect(rel);
+      this.echo.expectDelete(rel);
       await moveToTrash(this.dir, rel).catch(() => {}); // recuperação antes de apagar
       try { await fsp.rm(abs, { force: true }); } catch { /* corrida */ }
     }
@@ -638,57 +531,7 @@ export class SyncEngine {
   }
 
   // ---- Diretórios (pastas vazias) ----
-
-  onLocalAddDir(absPath) {
-    const rel = normalizeRel(path.relative(this.dir, absPath).split(path.sep).join('/')); // chave NFC (ver manifest.js)
-    if (!rel) return;
-    if (this.suppressDirAdd.has(rel)) { this.suppressDirAdd.delete(rel); this.dirs.add(rel); return; }
-    this.dirs.add(rel);
-    if (this.ws && this.ws.readyState === this.ws.OPEN) this.ws.send(JSON.stringify({ type: MSG.MKDIR, rel }));
-  }
-
-  onLocalRmDir(absPath) {
-    const rel = normalizeRel(path.relative(this.dir, absPath).split(path.sep).join('/')); // chave NFC (ver manifest.js)
-    if (!rel) return;
-    if (this.suppressDirDel.has(rel)) { this.suppressDirDel.delete(rel); this.dirs.delete(rel); return; }
-    this.dirs.delete(rel);
-    if (this.ws && this.ws.readyState === this.ws.OPEN) this.ws.send(JSON.stringify({ type: MSG.RMDIR, rel }));
-  }
-
-  async applyRemoteMkdir(relRaw) {
-    const rel = normalizeRel(relRaw); // chave lógica em NFC (ver manifest.js)
-    if (!isSafeRel(this.dir, rel) || isIgnored(this.ig, rel)) return;
-    // Recusa se um ancestral existente for symlink p/ fora (ver isSafeTarget).
-    if (!(await this.isSafeTarget(rel))) { this.log(`mkdir recusado (caminho inseguro): ${rel}`); return; }
-    this.suppressDirAdd.add(rel);
-    setTimeout(() => this.suppressDirAdd.delete(rel), 10000);
-    await fsp.mkdir(toAbs(this.dir, rel), { recursive: true }).catch(() => {});
-    this.dirs.add(rel);
-  }
-
-  async applyRemoteRmdir(relRaw) {
-    const rel = normalizeRel(relRaw); // chave lógica em NFC (ver manifest.js)
-    if (!isSafeRel(this.dir, rel)) return;
-    // Defesa-em-profundidade: ancestral symlink p/ fora atravessaria o rmdir (ver isSafeTarget).
-    if (!(await this.isSafeTarget(rel))) { this.log(`rmdir recusado (caminho inseguro): ${rel}`); return; }
-    this.suppressDirDel.add(rel);
-    setTimeout(() => this.suppressDirDel.delete(rel), 10000);
-    await fsp.rmdir(toAbs(this.dir, rel)).catch(() => {}); // só remove se vazio
-    this.dirs.delete(rel);
-  }
-
-  async reconcileDirs(peerDirs) {
-    for (const raw of peerDirs) {
-      const rel = normalizeRel(raw); // chave lógica em NFC (ver manifest.js)
-      if (this.dirs.has(rel) || isIgnored(this.ig, rel)) continue;
-      // Recusa se um ancestral existente for symlink p/ fora (ver isSafeTarget).
-      if (!(await this.isSafeTarget(rel))) { this.log(`mkdir (reconcile) recusado (caminho inseguro): ${rel}`); continue; }
-      this.suppressDirAdd.add(rel);
-      setTimeout(() => this.suppressDirAdd.delete(rel), 10000);
-      await fsp.mkdir(toAbs(this.dir, rel), { recursive: true }).catch(() => {});
-      this.dirs.add(rel);
-    }
-  }
+  // mkdir/rmdir local/remoto + reconcileDirs ficam em DirSync (ver dir-sync.js).
 
   async applyRemoteRename(fromRaw, toRaw) {
     const from = normalizeRel(fromRaw); // chaves lógicas em NFC (ver manifest.js)
@@ -701,7 +544,7 @@ export class SyncEngine {
       return;
     }
     const hash = this.manifest[from] ? this.manifest[from].hash : null;
-    this.suppressDelete.expect(from);     // o unlink do origem será suprimido
+    this.echo.expectDelete(from);         // o unlink do origem será suprimido
     if (hash) this.expectWrite(to, hash); // o add do destino será suprimido
     try {
       await fsp.mkdir(path.dirname(toAbs(this.dir, to)), { recursive: true });
@@ -721,10 +564,9 @@ export class SyncEngine {
 
   async stop() {
     if (this.saveTimer) { clearTimeout(this.saveTimer); this.saveTimer = null; }
-    for (const [, ent] of this.recentUnlinks) clearTimeout(ent.timer);
-    this.recentUnlinks.clear();
+    this.liveRename.clear();
     saveState(this.dir, { files: this.manifest, tombstones: this.tombstones }); // estado atualizado ao sair
-    this.suppressDelete.clear();
+    this.echo.clear();
     if (this.watcher) await this.watcher.close();
     await this.detach();
   }
