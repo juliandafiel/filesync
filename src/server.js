@@ -40,20 +40,46 @@ export async function startShare({ dir, port, noTunnel, checksum, log }) {
   // noServer: validamos o token no handshake antes de aceitar.
   const wss = new WebSocketServer({ noServer: true });
   let busy = false;
-  let failedAuth = 0; // rate-limit simples de tentativas com token errado
+
+  // Rate-limit de tentativas com token inválido COM DECAIMENTO temporal.
+  //
+  // POR QUE NÃO MATAR O PROCESSO: a versão anterior chamava process.exit(1) após
+  // 20 tokens errados. Como a URL pública do túnel é conhecida por quem recebe o
+  // link (e pode vazar), qualquer um conseguia derrubar o host só mandando 20
+  // requests errados — o "rate-limit" virava um botão de desligar (DoS crítico).
+  // O token tem 24 bytes (~192 bits), então brute-force já é inviável; aqui só
+  // precisamos não ser um vetor de DoS. Logo: NUNCA encerramos o processo por
+  // falha de auth. Apenas atrasamos a resposta 401 quando há muitas falhas
+  // recentes (janela deslizante por decaimento), mantendo o host VIVO.
+  let failScore = 0;        // "pontuação" de falhas recentes (decai com o tempo)
+  let lastFailAt = 0;       // instante da última falha, para calcular o decaimento
+  const FAIL_DECAY_MS = 5000;   // 1 ponto de falha decai a cada 5s
+  const FAIL_FREE = 5;          // primeiras falhas não sofrem atraso
+  const FAIL_DELAY_STEP = 250;  // atraso adicional por ponto acima do limite livre
+  const FAIL_DELAY_MAX = 5000;  // teto do atraso (nunca prende recursos por muito tempo)
 
   server.on('upgrade', (req, socket, head) => {
     // Token só via header (query string vazaria em logs/infra do túnel).
     if (!tokenMatches(req.headers['x-filesync-token'], token)) {
-      failedAuth++;
-      if (failedAuth >= 20) {
-        log('muitas tentativas de token inválido — encerrando por segurança');
+      // Aplica o decaimento desde a última falha antes de contabilizar a nova.
+      const now = Date.now();
+      if (lastFailAt) failScore = Math.max(0, failScore - (now - lastFailAt) / FAIL_DECAY_MS);
+      lastFailAt = now;
+      failScore++;
+      // Atraso crescente (mas limitado) só quando há excesso de falhas recentes.
+      // Não bloqueia o event loop: usa setTimeout e destrói o socket ao final.
+      const over = Math.max(0, failScore - FAIL_FREE);
+      const delayMs = Math.min(FAIL_DELAY_MAX, over * FAIL_DELAY_STEP);
+      const reject = () => {
+        try { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); } catch { /* socket já morto */ }
         socket.destroy();
-        setImmediate(() => shutdown().then(() => process.exit(1)));
-        return;
+      };
+      if (delayMs > 0) {
+        if (failScore === FAIL_FREE + 1) log('muitas tentativas de token inválido — aplicando atraso (host segue no ar)');
+        setTimeout(reject, delayMs).unref?.();
+      } else {
+        reject();
       }
-      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-      socket.destroy();
       return;
     }
     if (busy) {
@@ -61,7 +87,9 @@ export async function startShare({ dir, port, noTunnel, checksum, log }) {
       socket.destroy();
       return;
     }
-    failedAuth = 0;
+    // Auth bem-sucedida: zera a pontuação de falhas.
+    failScore = 0;
+    lastFailAt = 0;
     // Reserva a vaga SINCRONAMENTE aqui: fecha a janela de corrida em que duas
     // conexões simultâneas passariam o gate antes de 'connection' disparar.
     busy = true;
@@ -72,6 +100,12 @@ export async function startShare({ dir, port, noTunnel, checksum, log }) {
 
   wss.on('connection', (rawWs) => {
     const secure = new SecureSocket(rawWs, cryptoKey); // E2E
+    // Listener defensivo: a SecureSocket emite 'error' quando um frame falha ao
+    // decifrar (peer sem a chave correta). Sem um handler, o EventEmitter LANÇA
+    // em 'error' e derruba o host. Aqui só LOGAMOS — a SecureSocket fecha o ws
+    // subjacente, o que dispara rawWs.on('close' abaixo (engine.detach + busy=false),
+    // liberando a vaga única. Mantemos o host vivo independentemente.
+    secure.on('error', (e) => log('falha no canal seguro: ' + e.message));
     const stopKA = startKeepalive(rawWs, {
       onDead: () => { log('peer sem resposta — encerrando conexão'); rawWs.terminate(); },
     });

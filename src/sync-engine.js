@@ -14,7 +14,7 @@ import { isIgnored, TEMP_SUFFIX } from './ignore.js';
 import { loadState, saveState } from './state.js';
 import { DeleteSuppressor } from './suppress.js';
 import { moveToTrash, pruneTrash } from './trash.js';
-import { detectCaseCollisions } from './normalize.js';
+import { detectCaseCollisions, normalizeRel } from './normalize.js';
 import { signature, diff, apply } from './delta.js';
 import { newTransferId } from './transfer.js';
 import crypto from 'node:crypto';
@@ -23,7 +23,17 @@ const DELTA_MIN = 256 * 1024;        // só vale a pena delta acima disto
 const DELTA_MAX = 64 * 1024 * 1024;  // acima disto, transfere cheio (memória)
 const DELTA_BLOCK = 4096;
 
-// Garante que um caminho relativo recebido do peer não escapa da pasta raiz.
+// Reescreve as chaves de um objeto rel->valor para a forma canônica NFC.
+// Usado nos manifestos/tombstones recebidos do peer para que NFC e NFD do mesmo
+// nome não sejam tratados como dois arquivos distintos (ver normalize.js).
+function normalizeKeys(obj) {
+  const out = {};
+  for (const k of Object.keys(obj)) out[normalizeRel(k)] = obj[k];
+  return out;
+}
+
+// Garante (LEXICAMENTE) que um caminho relativo recebido do peer não escapa da
+// pasta raiz. É só a primeira barreira: não enxerga symlinks (ver isSafeTarget).
 function isSafeRel(dir, rel) {
   if (!rel || rel.includes('\0')) return false;
   const abs = path.resolve(dir, rel.split('/').join(path.sep));
@@ -143,7 +153,7 @@ export class SyncEngine {
       for (const e of entries) {
         if (!e.isDirectory()) continue;
         const abs = path.join(cur, e.name);
-        const rel = path.relative(this.dir, abs).split(path.sep).join('/');
+        const rel = normalizeRel(path.relative(this.dir, abs).split(path.sep).join('/')); // chave NFC (ver manifest.js)
         if (isIgnored(this.ig, rel + '/') || isIgnored(this.ig, rel)) continue;
         out.add(rel);
         await walk(abs);
@@ -216,8 +226,11 @@ export class SyncEngine {
         this.log(`conectado (peer ${msg.isHost ? 'host' : 'cliente'}, protocolo v${msg.version}, offset ${this.clockOffset}ms)`);
         break;
       case MSG.MANIFEST:
-        this.peerManifest = msg.files || {};
-        this.peerTombstones = msg.tombstones || {};
+        // Canoniza as CHAVES recebidas para NFC (ver manifest.js): garante que a
+        // comparação contra o manifesto local (já NFC) trate NFC/NFD como o mesmo
+        // arquivo, mesmo que o peer ainda não normalize.
+        this.peerManifest = normalizeKeys(msg.files || {});
+        this.peerTombstones = normalizeKeys(msg.tombstones || {});
         await this.reconcileDirs(msg.dirs || []);
         await this.reconcile();
         break;
@@ -242,6 +255,11 @@ export class SyncEngine {
         await this.applyDelta(msg);
         break;
       case MSG.FILE_BEGIN: {
+        // Chave lógica em NFC (ver manifest.js): normaliza o rel ANTES de validar,
+        // suprimir o eco e entregar ao receiver, para que a chave de manifesto, a
+        // supressão e o caminho gravado coincidam com a forma canônica usada nos
+        // dois lados. (Mantém-se o msg original; só substituímos o rel.)
+        msg.rel = normalizeRel(msg.rel);
         const motivo = await this.rejectReason(msg.rel);
         if (motivo) {
           this.log(`recusado (${motivo}): ${msg.rel}`);
@@ -266,11 +284,43 @@ export class SyncEngine {
     }
   }
 
+  // Verificação de segurança REFORÇADA contra path traversal por symlink.
+  // isSafeRel é só lexico (path.resolve) e não enxerga symlinks; um symlink-pasta
+  // num componente INTERMEDIÁRIO (ex: raiz/link -> /home/vitima/.ssh) faria a
+  // escrita aterrissar FORA da pasta mesmo com rel "seguro". Aqui resolvemos com
+  // fs.realpath o ancestral EXISTENTE mais profundo do caminho e exigimos que
+  // ele continue DENTRO de realpath(this.dir). Se algum componente já existente
+  // for um symlink apontando para fora, a operação é recusada.
+  async isSafeTarget(rel) {
+    if (!isSafeRel(this.dir, rel)) return false;
+    let realRoot;
+    try { realRoot = await fsp.realpath(this.dir); }
+    catch { return false; } // sem raiz real não há como garantir contenção
+    const abs = toAbs(this.dir, rel);
+    // Sobe pelos ancestrais até achar um que exista no disco; esse é o mais
+    // profundo cujo realpath conseguimos resolver (o resto ainda será criado).
+    let probe = path.dirname(abs);
+    for (;;) {
+      try {
+        const real = await fsp.realpath(probe);
+        // O ancestral existente tem que ser a própria raiz ou estar dentro dela.
+        if (real !== realRoot && !real.startsWith(realRoot + path.sep)) return false;
+        return true;
+      } catch {
+        const parent = path.dirname(probe);
+        if (parent === probe) return false; // chegou na raiz do FS sem resolver
+        probe = parent;
+      }
+    }
+  }
+
   // Valida um caminho recebido do peer. Devolve o motivo da recusa, ou null.
   async rejectReason(rel) {
     if (!isSafeRel(this.dir, rel)) return 'caminho inseguro';
     if (isIgnored(this.ig, rel)) return 'arquivo ignorado';
-    // Não escrever através de um symlink (escaparia da raiz apesar do isSafeRel).
+    // Symlink num componente intermediário escaparia da raiz apesar do isSafeRel.
+    if (!(await this.isSafeTarget(rel))) return 'caminho inseguro (symlink)';
+    // Não escrever através de um symlink na FOLHA (idem, escaparia da raiz).
     try {
       const st = await fsp.lstat(toAbs(this.dir, rel));
       if (st.isSymbolicLink()) return 'symlink';
@@ -359,6 +409,7 @@ export class SyncEngine {
 
   // Peer pediu a assinatura do nosso arquivo antigo (para nos mandar um delta).
   async handleDeltaReq(msg) {
+    msg.rel = normalizeRel(msg.rel); // chave lógica em NFC (ver manifest.js)
     if (!isSafeRel(this.dir, msg.rel)) { this.ws.send(JSON.stringify({ type: MSG.SIG, transferId: msg.transferId, has: false })); return; }
     let buf;
     try { buf = await fsp.readFile(toAbs(this.dir, msg.rel)); } catch {
@@ -371,6 +422,7 @@ export class SyncEngine {
 
   // Recebe um delta: reconstrói o arquivo a partir do antigo + ops e valida hash.
   async applyDelta(msg) {
+    msg.rel = normalizeRel(msg.rel); // chave lógica em NFC (ver manifest.js)
     const motivo = await this.rejectReason(msg.rel);
     if (motivo) { this.log(`delta recusado (${motivo}): ${msg.rel}`); return; }
     let oldBuf;
@@ -418,7 +470,9 @@ export class SyncEngine {
   // ---- Watcher local ----
 
   async onLocalUpsert(absPath) {
-    const rel = path.relative(this.dir, absPath).split(path.sep).join('/');
+    // Chave lógica em NFC (ver manifest.js): mesmo nome visível tem que casar
+    // entre os peers mesmo que o disco use NFD (macOS).
+    const rel = normalizeRel(path.relative(this.dir, absPath).split(path.sep).join('/'));
     let meta;
     try {
       const stat = await fsp.stat(absPath);
@@ -446,10 +500,12 @@ export class SyncEngine {
       return;
     }
 
-    // RENAME? Um unlink recente com o MESMO hash = arquivo movido. Mandamos
-    // RENAME (mover no peer) em vez de retransferir o conteúdo.
+    // RENAME? Um unlink recente com o MESMO hash E TAMANHO = arquivo movido.
+    // Exigir size também evita rename espúrio por colisão de hash entre arquivos
+    // de identidades diferentes (que engoliria uma deleção real). Mandamos RENAME
+    // (mover no peer) em vez de retransferir o conteúdo.
     for (const [oldRel, ent] of this.recentUnlinks) {
-      if (ent.hash === meta.hash) {
+      if (ent.hash === meta.hash && ent.size === meta.size) {
         clearTimeout(ent.timer);
         this.recentUnlinks.delete(oldRel);
         this.manifest[rel] = meta;
@@ -473,14 +529,19 @@ export class SyncEngine {
   }
 
   onLocalUnlink(absPath) {
-    const rel = path.relative(this.dir, absPath).split(path.sep).join('/');
+    // Chave lógica em NFC (ver manifest.js).
+    const rel = normalizeRel(path.relative(this.dir, absPath).split(path.sep).join('/'));
     // Eco de uma deleção que veio do peer? Consome (contador) e não re-propaga.
     if (this.suppressDelete.consume(rel)) {
       delete this.manifest[rel];
       this.scheduleSave();
       return;
     }
-    const hash = this.manifest[rel] ? this.manifest[rel].hash : null;
+    // Captura hash E size ANTES de apagar do manifesto: o rename ao vivo exige
+    // ambos iguais (ver onLocalUpsert) para não casar arquivos só por hash.
+    const prev = this.manifest[rel];
+    const hash = prev ? prev.hash : null;
+    const size = prev ? prev.size : null;
     delete this.manifest[rel];
     this.scheduleSave();
     // Adia a propagação ~800ms para detectar rename (add com mesmo hash logo
@@ -488,7 +549,7 @@ export class SyncEngine {
     if (hash) {
       const timer = setTimeout(() => this.finalizeDelete(rel), 800);
       if (timer.unref) timer.unref();
-      this.recentUnlinks.set(rel, { hash, timer });
+      this.recentUnlinks.set(rel, { hash, size, timer });
     } else {
       this.finalizeDelete(rel);
     }
@@ -532,8 +593,12 @@ export class SyncEngine {
     this.maybeInSync();
   }
 
-  async applyRemoteDelete(rel, deletedAt) {
+  async applyRemoteDelete(relRaw, deletedAt) {
+    const rel = normalizeRel(relRaw); // chave lógica em NFC (ver manifest.js)
     if (!isSafeRel(this.dir, rel)) return;
+    // Defesa-em-profundidade: um ancestral symlink p/ fora faria o rm/fsp.rm
+    // atravessar e apagar algo FORA da raiz (ver isSafeTarget).
+    if (!(await this.isSafeTarget(rel))) { this.log(`delete recusado (caminho inseguro): ${rel}`); return; }
     const abs = toAbs(this.dir, rel);
     // Converte o instante da deleção (relógio do peer) para o relógio local.
     const deletedAtLocal = typeof deletedAt === 'number' ? deletedAt - this.clockOffset : Date.now();
@@ -544,7 +609,10 @@ export class SyncEngine {
       const st = await fsp.stat(abs);
       if (Math.floor(st.mtimeMs) > deletedAtLocal) {
         this.log(`delete ignorado (edição local mais nova): ${rel}`);
-        await this.pushFile(rel);
+        // allowDelta:false: estamos DENTRO da fila serial de mensagens; esperar a
+        // resposta SIG do delta aqui travaria a própria fila (deadlock ~30s).
+        // Mesmo motivo do allowDelta:false na reconcile (ver pushFile).
+        await this.pushFile(rel, { allowDelta: false });
         return;
       }
     } catch { /* não existe localmente: segue com o delete (vira tombstone) */ }
@@ -572,7 +640,7 @@ export class SyncEngine {
   // ---- Diretórios (pastas vazias) ----
 
   onLocalAddDir(absPath) {
-    const rel = path.relative(this.dir, absPath).split(path.sep).join('/');
+    const rel = normalizeRel(path.relative(this.dir, absPath).split(path.sep).join('/')); // chave NFC (ver manifest.js)
     if (!rel) return;
     if (this.suppressDirAdd.has(rel)) { this.suppressDirAdd.delete(rel); this.dirs.add(rel); return; }
     this.dirs.add(rel);
@@ -580,23 +648,29 @@ export class SyncEngine {
   }
 
   onLocalRmDir(absPath) {
-    const rel = path.relative(this.dir, absPath).split(path.sep).join('/');
+    const rel = normalizeRel(path.relative(this.dir, absPath).split(path.sep).join('/')); // chave NFC (ver manifest.js)
     if (!rel) return;
     if (this.suppressDirDel.has(rel)) { this.suppressDirDel.delete(rel); this.dirs.delete(rel); return; }
     this.dirs.delete(rel);
     if (this.ws && this.ws.readyState === this.ws.OPEN) this.ws.send(JSON.stringify({ type: MSG.RMDIR, rel }));
   }
 
-  async applyRemoteMkdir(rel) {
+  async applyRemoteMkdir(relRaw) {
+    const rel = normalizeRel(relRaw); // chave lógica em NFC (ver manifest.js)
     if (!isSafeRel(this.dir, rel) || isIgnored(this.ig, rel)) return;
+    // Recusa se um ancestral existente for symlink p/ fora (ver isSafeTarget).
+    if (!(await this.isSafeTarget(rel))) { this.log(`mkdir recusado (caminho inseguro): ${rel}`); return; }
     this.suppressDirAdd.add(rel);
     setTimeout(() => this.suppressDirAdd.delete(rel), 10000);
     await fsp.mkdir(toAbs(this.dir, rel), { recursive: true }).catch(() => {});
     this.dirs.add(rel);
   }
 
-  async applyRemoteRmdir(rel) {
+  async applyRemoteRmdir(relRaw) {
+    const rel = normalizeRel(relRaw); // chave lógica em NFC (ver manifest.js)
     if (!isSafeRel(this.dir, rel)) return;
+    // Defesa-em-profundidade: ancestral symlink p/ fora atravessaria o rmdir (ver isSafeTarget).
+    if (!(await this.isSafeTarget(rel))) { this.log(`rmdir recusado (caminho inseguro): ${rel}`); return; }
     this.suppressDirDel.add(rel);
     setTimeout(() => this.suppressDirDel.delete(rel), 10000);
     await fsp.rmdir(toAbs(this.dir, rel)).catch(() => {}); // só remove se vazio
@@ -604,8 +678,11 @@ export class SyncEngine {
   }
 
   async reconcileDirs(peerDirs) {
-    for (const rel of peerDirs) {
+    for (const raw of peerDirs) {
+      const rel = normalizeRel(raw); // chave lógica em NFC (ver manifest.js)
       if (this.dirs.has(rel) || isIgnored(this.ig, rel)) continue;
+      // Recusa se um ancestral existente for symlink p/ fora (ver isSafeTarget).
+      if (!(await this.isSafeTarget(rel))) { this.log(`mkdir (reconcile) recusado (caminho inseguro): ${rel}`); continue; }
       this.suppressDirAdd.add(rel);
       setTimeout(() => this.suppressDirAdd.delete(rel), 10000);
       await fsp.mkdir(toAbs(this.dir, rel), { recursive: true }).catch(() => {});
@@ -613,8 +690,16 @@ export class SyncEngine {
     }
   }
 
-  async applyRemoteRename(from, to) {
+  async applyRemoteRename(fromRaw, toRaw) {
+    const from = normalizeRel(fromRaw); // chaves lógicas em NFC (ver manifest.js)
+    const to = normalizeRel(toRaw);
     if (!isSafeRel(this.dir, from) || !isSafeRel(this.dir, to) || isIgnored(this.ig, to)) return;
+    // Recusa se um ancestral existente de ORIGEM ou DESTINO for symlink p/ fora:
+    // ler/gravar através dele escaparia da raiz (ver isSafeTarget).
+    if (!(await this.isSafeTarget(from)) || !(await this.isSafeTarget(to))) {
+      this.log(`rename recusado (caminho inseguro): ${from} -> ${to}`);
+      return;
+    }
     const hash = this.manifest[from] ? this.manifest[from].hash : null;
     this.suppressDelete.expect(from);     // o unlink do origem será suprimido
     if (hash) this.expectWrite(to, hash); // o add do destino será suprimido

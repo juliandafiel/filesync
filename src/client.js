@@ -37,6 +37,12 @@ export async function startJoin({ link, dir, checksum, log }) {
       attempt = 0;
       log('conectado ao host');
       secure = new SecureSocket(ws, cryptoKey); // E2E
+      // Listener defensivo: a SecureSocket emite 'error' ao falhar decifrar um
+      // frame (chave incorreta). Sem handler, o EventEmitter LANÇA em 'error' e
+      // mata o cliente. Aqui só LOGAMOS; a SecureSocket fecha o ws subjacente, o
+      // que dispara ws.on('close' abaixo (detach + reconexão com backoff). O
+      // cliente nunca quebra se o canal seguro emitir 'error'.
+      secure.on('error', (e) => log('falha no canal seguro: ' + e.message));
       stopKA = startKeepalive(ws, {
         onDead: () => { log('host sem resposta — reconectando'); ws.terminate(); },
       });

@@ -1,8 +1,9 @@
 # filesync
 
-Sincronizador de **uma pasta** em tempo real entre dois PCs, estilo "Google Drive
-desktop" mas minimalista: você compartilha uma pasta e gera um **link**; o outro
-PC usa o link para entrar. Toda alteração feita de um lado é refletida no outro.
+Sincronizador **P2P minimalista de uma pasta** entre **dois PCs**, em tempo real,
+por **linha de comando**: você compartilha uma pasta e gera um **link**; o outro
+PC usa o link (via túnel público) para entrar. Toda alteração feita de um lado é
+refletida no outro, enquanto os dois estiverem online.
 
 - 🔄 Sincronização **bidirecional** em tempo real (cria, edita, apaga).
 - 🌐 Funciona **pela internet** via túnel automático (link `https`/`wss` público).
@@ -16,6 +17,19 @@ PC usa o link para entrar. Toda alteração feita de um lado é refletida no out
 - 📁 Sincroniza **pastas vazias** e detecta **renomeações** (move sem retransferir).
 - 🩺 **Integridade garantida** (hash + tamanho), **keepalive** (detecta conexão morta), **checagem de espaço** em disco, **link estável** entre reinícios e **deleções offline** propagadas.
 - 🖥️ Pode rodar em **segundo plano** (`filesync daemon`).
+
+## Para quem isto serve (e para quem não serve)
+
+**Serve** se você quer sincronizar **uma pasta entre dois PCs** por linha de
+comando, em tempo real, com criptografia ponta-a-ponta, sem instalar um serviço
+pesado nem confiar o conteúdo a uma nuvem.
+
+**Não serve** se você precisa de mais de dois dispositivos, de uma interface
+gráfica, ou de sync assíncrono entre máquinas que raramente estão online ao
+mesmo tempo: aqui **os dois PCs precisam estar online juntos** para sincronizar,
+o transporte depende de um **túnel público gratuito** (`localtunnel`) e a CLI é
+a única interface. Para N dispositivos, GUI e sync mais robusto, o
+[Syncthing](https://syncthing.net) é a alternativa madura.
 
 ## Requisitos
 
@@ -109,6 +123,10 @@ PC A (share)                 túnel público (wss)              PC B (join)
   `mtime` batem com o cache salvo em `.filesync-state.json`, o hash anterior é
   reaproveitado — só arquivos novos/alterados são re-hasheados. Use `--checksum`
   para forçar o rehash de tudo.
+- **Deleções feitas com o app desligado são detectadas**: no boot, o que estava
+  no estado salvo (`.filesync-state.json`) e não aparece mais na varredura atual
+  vira um *tombstone*, então a deleção é propagada na próxima conexão em vez de o
+  arquivo ser ressuscitado pelo outro lado.
 - O conteúdo é gravado em arquivo temporário, **validado por hash + tamanho** e
   só então renomeado (escrita atômica). O watcher tem **supressão de eco** para
   não reenviar o que acabou de receber.
@@ -129,16 +147,18 @@ edição, subpastas, deleção, ignore de `.git` e ausência de loop de eco.
   dois PCs estarem próximos. Com relógios muito dessincronizados, uma edição mais
   nova pode perder para uma mais antiga. (Mitigado: se o hash for igual, nada é
   sobrescrito.)
-- **Deleções offline** não são detectadas: se você apagar um arquivo com o app
-  desligado, ele pode ser ressuscitado pelo outro lado na próxima conexão. Apague
-  com o app rodando para a deleção propagar.
 - Symlinks são ignorados nesta versão.
 - O túnel padrão (`localtunnel`) usa um serviço público gratuito; para algo mais
   robusto, dá para trocar o provider em `src/tunnel.js` (ex: `cloudflared`).
   A criptografia E2E protege o conteúdo mesmo que o túnel seja não-confiável.
 - **Retomada de transferência interrompida** ainda não é feita no meio do arquivo:
-  se a conexão cair durante um envio grande, ele recomeça (mitigado pelo delta
-  sync, que reenvia só os blocos faltantes na próxima vez). Arquivos `.tmp`
-  parciais são limpos automaticamente.
-- Normalização Unicode (NFC/NFD) não é forçada para não quebrar nomes
-  byte-exatos no Linux; o app **avisa** sobre colisões de maiúsculas/acentos.
+  se a conexão cair durante um envio grande, ele recomeça do **zero**. Na
+  reconciliação pós-queda o delta sync fica **desligado** de propósito (para
+  evitar deadlock), então o arquivo é reenviado **inteiro**; o delta só atua em
+  edições ao vivo posteriores. Arquivos `.tmp` parciais são limpos
+  automaticamente.
+- Normalização Unicode: a **chave lógica** de cada caminho é normalizada para
+  **NFC** na comparação/manifesto/protocolo, de modo que o mesmo nome em NFC
+  (Linux/Windows) e NFD (macOS) seja tratado como **um único arquivo** e não
+  divirja. Os **bytes do nome no disco são preservados** (não há renomeação
+  forçada NFC→NFD). O app também **avisa** sobre colisões de maiúsculas/acentos.

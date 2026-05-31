@@ -5,6 +5,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { isIgnored } from './ignore.js';
+import { normalizeRel } from './normalize.js';
 
 export function toRel(dir, abs) {
   return path.relative(dir, abs).split(path.sep).join('/');
@@ -49,7 +50,11 @@ export async function buildManifest(dir, ig, opts = {}) {
     }
     for (const entry of entries) {
       const abs = path.join(current, entry.name);
-      const rel = toRel(dir, abs);
+      // Chave LÓGICA sempre em NFC: macOS guarda NFD, Linux/Windows NFC. Sem
+      // normalizar, o mesmo nome visível vira dois arquivos distintos entre os
+      // peers. 'abs' continua com os bytes reais do disco (para acessar o
+      // arquivo); só a chave de manifesto/comparação é canonizada.
+      const rel = normalizeRel(toRel(dir, abs));
       // Symlinks são ignorados por segurança/simplicidade nesta versão.
       if (entry.isSymbolicLink()) continue;
       if (entry.isDirectory()) {
