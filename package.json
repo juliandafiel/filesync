@@ -1,0 +1,31 @@
+{
+  "name": "filesync",
+  "version": "1.0.0",
+  "description": "Sincronizador de uma pasta em tempo real entre dois PCs, via link/túnel.",
+  "type": "module",
+  "bin": {
+    "filesync": "bin/cli.js"
+  },
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node bin/cli.js",
+    "test:unit": "for t in reconcile state suppress crypto trash keepalive diskspace identity rename normalize delta daemon; do node test/unit-$t.mjs || exit 1; done && node test/unit.mjs",
+    "test:e2e": "node test/e2e.mjs && node test/e2e-offline.mjs && node test/e2e-secure.mjs && node test/e2e-dirs.mjs && node test/e2e-delta.mjs",
+    "test": "npm run test:unit && npm run test:e2e"
+  },
+  "keywords": [
+    "sync",
+    "file-sync",
+    "websocket",
+    "tunnel"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "chokidar": "^5.0.0",
+    "commander": "^15.0.0",
+    "ignore": "^7.0.5",
+    "localtunnel": "^2.0.2",
+    "ws": "^8.21.0"
+  }
+}

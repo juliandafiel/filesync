@@ -1,0 +1,5 @@
+node_modules/
+.filesync-state.json
+.filesync-id.json
+.filesync-trash/
+*.filesync-tmp

@@ -1,0 +1,20 @@
+# Template systemd para rodar o filesync sempre ligado (always-on).
+# Copie para ~/.config/systemd/user/filesync.service (modo usuario)
+# ou /etc/systemd/system/filesync.service (modo sistema) e substitua:
+#   <PASTA>        -> caminho absoluto da pasta a sincronizar (ex: /home/jaco/sync)
+#   <LINK_OU_ARGS> -> args do CLI: 'share <PASTA>' ou 'join <LINK> <PASTA>'
+
+[Unit]
+Description=filesync - sincronizador de arquivos
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=<PASTA>
+ExecStart=/usr/bin/env node bin/cli.js <LINK_OU_ARGS>
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

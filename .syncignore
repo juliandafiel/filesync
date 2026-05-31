@@ -1,0 +1,8 @@
+# Padrões estilo .gitignore. Linhas com # são comentários.
+# .git já é sempre ignorado pelo app, mesmo sem estar aqui.
+
+# Descomente o que fizer sentido para sua pasta:
+# node_modules/
+# *.log
+# *.tmp
+# .DS_Store
