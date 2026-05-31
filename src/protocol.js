@@ -18,6 +18,12 @@ export const MSG = {
   SIG: 'sig',         // resposta: assinatura por blocos do arquivo antigo
   DELTA: 'delta',     // ops (copiar bloco / dados literais) para reconstruir
   REJECT: 'reject',
+  // ACK/NACK fim-a-fim: o RECEPTOR confirma (ACK) ou recusa (NACK) uma escrita.
+  // Sem isto, o remetente marcava peerManifest otimista mesmo quando o receptor
+  // rejeitava (disco cheio, erro de escrita, hash divergente, versão local mais
+  // nova) — peerManifest mentia e o arquivo não era reenviado. Ver sync-engine.js.
+  ACK: 'ack',
+  NACK: 'nack',
 };
 
 export const PROTOCOL_VERSION = 1;

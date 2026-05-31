@@ -45,6 +45,11 @@ export class SyncEngine {
     this.receiver = null;
     this.watcher = null;
     this.saveTimer = null;
+    // Envios em voo aguardando ACK/NACK: transferId -> { rel, meta, retries }.
+    // Permite reverter o peerManifest otimista num NACK e reenviar (1x) em falha
+    // recuperável. Cap de 1 retry por transferId; resetado a cada conexão
+    // (limpo em detach()/stop()) para não acumular loop de reenvio. Ver onControl.
+    this.inflight = new Map();
     // Anti-eco centralizado: escritas (suppressAdd), deleções (DeleteSuppressor)
     // e mkdir/rmdir de diretórios. Ver echo-suppress.js.
     this.echo = new EchoSuppressor();
@@ -99,7 +104,16 @@ export class SyncEngine {
     let offline = 0;
     for (const rel of Object.keys(files)) {
       if (!this.manifest[rel] && this.tombstones[rel] === undefined && !isIgnored(this.ig, rel)) {
-        this.tombstones[rel] = now;
+        // PORQUÊ: carimbar com `now` (instante do boot) faz a deleção offline
+        // SEMPRE vencer qualquer edição concorrente que o peer tenha feito
+        // offline (boot > qualquer edição anterior) — perda de dado. A deleção
+        // aconteceu em ALGUM momento entre a última versão conhecida (mtime) e o
+        // boot; carimbar no mtime da última versão conhecida é o limite inferior
+        // conservador: se o peer não mexeu (mtime igual), o empate do caso 2 da
+        // reconcile ainda propaga a deleção; se o peer editou mais novo, a edição
+        // vence e ressuscita o arquivo. Guarda: mtime ausente/inválido -> `now`.
+        const t = (files[rel] && Number.isFinite(files[rel].mtimeMs)) ? files[rel].mtimeMs : now;
+        this.tombstones[rel] = t;
         offline++;
       }
     }
@@ -153,10 +167,23 @@ export class SyncEngine {
     this.peerManifest = {};
     this.peerTombstones = {};
     this.receiver = new TransferReceiver(this.dir, {
-      onComplete: (rel, meta) => this.onRemoteFileWritten(rel, meta),
-      onReject: (rel, motivo) => {
+      onComplete: (rel, meta, transferId) => {
+        this.onRemoteFileWritten(rel, meta);
+        // ACK fim-a-fim: confirma ao REMETENTE que a escrita foi promovida, para
+        // ele limpar o inflight (peerManifest já estava otimisticamente correto).
+        if (this.ws && this.ws.readyState === this.ws.OPEN) {
+          this.ws.send(JSON.stringify({ type: MSG.ACK, transferId }));
+        }
+      },
+      onReject: (rel, motivo, transferId) => {
         this.echo.cancelWrite(rel); // libera a supressão de um eco que não virá
         this.log(`recebimento rejeitado (${rel}): ${motivo}`);
+        // NACK fim-a-fim: avisa o REMETENTE que NÃO temos o arquivo, para ele
+        // reverter o peerManifest otimista e, se o motivo for recuperável,
+        // reenviar uma vez (ver handler de MSG.NACK).
+        if (this.ws && this.ws.readyState === this.ws.OPEN) {
+          this.ws.send(JSON.stringify({ type: MSG.NACK, rel, reason: motivo, transferId }));
+        }
       },
       log: this.log,
     });
@@ -189,6 +216,7 @@ export class SyncEngine {
     if (ws && ws !== this.ws) return;
     if (this.receiver) await this.receiver.cleanup();
     this.delta.cancelPending();
+    this.inflight.clear(); // reseta o cap de retry de ACK/NACK a cada conexão
     this.receiver = null;
     this.ws = null;
     this.peerManifest = null;
@@ -263,6 +291,52 @@ export class SyncEngine {
       case MSG.REJECT:
         this.log(`recusado pelo peer: ${msg.reason || 'sem motivo'}`);
         break;
+      case MSG.ACK:
+        // O peer confirmou a escrita: nada a corrigir (peerManifest já otimista).
+        // Só baixa o registro em voo correspondente.
+        this.inflight.delete(msg.transferId);
+        break;
+      case MSG.NACK: {
+        // O peer recusou a escrita: NÃO temos garantia de que ele tem o arquivo,
+        // então revertemos o peerManifest otimista (ser honesto evita "achar que
+        // entregou" e nunca reenviar). Pega rel/retries do inflight pelo
+        // transferId (caminho de envio completo) ou cai no msg.rel (caminho DELTA,
+        // que não usa o transferId de sendFile).
+        const entry = msg.transferId !== undefined ? this.inflight.get(msg.transferId) : undefined;
+        const rel = (entry && entry.rel) || msg.rel;
+        const retries = entry ? entry.retries : 0;
+        if (msg.transferId !== undefined) this.inflight.delete(msg.transferId);
+        if (!rel) break;
+        if (this.peerManifest) delete this.peerManifest[rel]; // o peer NÃO tem
+        // Motivos PERSISTENTES (corretos): não reenviar — resync ocorre na próxima
+        // edição/reconexão. 'versão local mais nova' é a regra "mais recente vence"
+        // do peer; 'sem espaço em disco' é uma condição de recurso do peer.
+        const persistente = msg.reason === 'sem espaço em disco' || msg.reason === 'versão local mais nova';
+        if (persistente) {
+          this.log(`NACK persistente (${msg.reason}) em ${rel}: não reenvio`);
+          break;
+        }
+        // Recuperável (erro de escrita, hash/tamanho divergente, delta inválido):
+        // reenvia UMA vez. Cap de 1 retry por transferId/rel por conexão evita
+        // loop infinito. allowDelta:false é OBRIGATÓRIO: este handler roda DENTRO
+        // da fila serial de mensagens; esperar SIG do delta aqui travaria a fila
+        // (mesmo motivo do applyRemoteDelete/reconcile).
+        if (retries < 1) {
+          this.log(`NACK recuperável (${msg.reason || 'sem motivo'}) em ${rel}: reenviando (retry ${retries + 1})`);
+          await this.pushFile(rel, { allowDelta: false });
+          // Marca o retry no novo registro em voo (criado pelo pushFile acima),
+          // procurando pelo rel, para que um segundo NACK não reenvie de novo.
+          for (const [tid, e] of this.inflight) {
+            if (e.rel === rel && e.retries === 0) { e.retries = retries + 1; break; }
+          }
+          // Caso o reenvio tenha caído no caminho DELTA (sem inflight), o cap por
+          // rel não persiste; mas allowDelta:false aqui garante envio COMPLETO,
+          // que registra inflight — então o cap vale.
+        } else {
+          this.log(`NACK em ${rel}: limite de retry atingido, desisto até próxima edição/reconexão`);
+        }
+        break;
+      }
     }
   }
 
@@ -351,7 +425,16 @@ export class SyncEngine {
         meta.size >= DELTA_MIN && meta.size <= DELTA_MAX;
       let sent = false;
       if (canDelta) sent = await this.delta.pushDelta(rel, meta, ws);
-      if (!sent) await sendFile(ws, toAbs(this.dir, rel), rel, meta);
+      if (!sent) {
+        // Envio COMPLETO: registra em voo pelo transferId para casar o ACK/NACK.
+        // (O caminho DELTA sinaliza NACK por rel sem transferId — ver onControl.)
+        const transferId = await sendFile(ws, toAbs(this.dir, rel), rel, meta);
+        if (this.ws === ws && transferId !== undefined) {
+          this.inflight.set(transferId, { rel, meta, retries: 0 });
+        }
+      }
+      // Set otimista do peerManifest: mantém-se mesmo em voo para evitar
+      // tempestade de reenvio na janela até o ACK; um NACK reverte explicitamente.
       if (this.peerManifest && this.ws === ws) this.peerManifest[rel] = meta; // peer tem esta versão
     } catch (e) {
       this.log(`falha ao enviar ${rel}: ${e.message}`);

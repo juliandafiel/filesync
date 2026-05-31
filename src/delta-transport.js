@@ -100,6 +100,18 @@ export class DeltaTransport {
     ws.send(JSON.stringify({ type: MSG.SIG, transferId: msg.transferId, has: true, blockSize: DELTA_BLOCK, sig }));
   }
 
+  // NACK do caminho DELTA: o DELTA não usa o transferId de sendFile, então
+  // sinalizamos só por rel (o handler de MSG.NACK no remetente trata rel sem
+  // transferId: reverte peerManifest[rel] e reenvia uma vez com allowDelta:false,
+  // caindo no envio COMPLETO — que então é confiável). Só envia se o ws estiver
+  // aberto (a conexão pode ter trocado durante os awaits do applyDelta).
+  nack(rel, reason) {
+    const ws = this.getWs();
+    if (ws && ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({ type: MSG.NACK, rel, reason }));
+    }
+  }
+
   // Casa um SIG recebido com a Promise pendente do pushDelta correspondente.
   resolveSig(msg) {
     const p = this.pendingSig.get(msg.transferId);
@@ -110,16 +122,17 @@ export class DeltaTransport {
   async applyDelta(msg) {
     msg.rel = normalizeRel(msg.rel); // chave lógica em NFC (ver manifest.js)
     const motivo = await this.rejectReason(msg.rel);
-    if (motivo) { this.log(`delta recusado (${motivo}): ${msg.rel}`); return; }
+    if (motivo) { this.log(`delta recusado (${motivo}): ${msg.rel}`); this.nack(msg.rel, motivo); return; }
     let oldBuf;
     try { oldBuf = await fsp.readFile(toAbs(this.dir, msg.rel)); } catch { oldBuf = Buffer.alloc(0); }
     const ops = msg.ops.map((o) => (o.d !== undefined ? { data: Buffer.from(o.d, 'base64') } : { copy: o.c }));
     let newBuf;
-    try { newBuf = apply(oldBuf, ops, msg.blockSize); } catch (e) { this.log(`delta falhou em ${msg.rel}: ${e.message}`); return; }
+    try { newBuf = apply(oldBuf, ops, msg.blockSize); } catch (e) { this.log(`delta falhou em ${msg.rel}: ${e.message}`); this.nack(msg.rel, 'delta inválido'); return; }
     // Integridade: o resultado tem que bater com o hash/tamanho anunciados.
     const digest = crypto.createHash('sha256').update(newBuf).digest('hex');
     if (digest !== msg.hash || newBuf.length !== msg.size) {
       this.log(`delta inválido em ${msg.rel} (hash/tamanho) — será re-sincronizado`);
+      this.nack(msg.rel, 'delta inválido');
       return;
     }
     this.onWork(); // chegou trabalho: re-anuncia "em sincronia" depois

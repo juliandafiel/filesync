@@ -8,7 +8,7 @@ import { deriveKey } from './crypto.js';
 import { SecureSocket } from './secure-socket.js';
 import { startKeepalive } from './keepalive.js';
 
-export async function startJoin({ link, dir, checksum, log }) {
+export async function startJoin({ link, dir, checksum, log, authTimeoutMs = 15000 }) {
   const { wsUrl, token, key } = parseLink(link);
   if (!token) log('aviso: link sem token (#t=...). A conexão pode ser recusada.');
   if (!key) log('aviso: link sem chave (#k=...). Sem criptografia ponta-a-ponta.');
@@ -32,6 +32,7 @@ export async function startJoin({ link, dir, checksum, log }) {
     let lastStatus = null; // statusCode de um handshake recusado
     let stopKA = null;
     let secure = null;
+    let authTimer = null;
 
     ws.on('open', () => {
       attempt = 0;
@@ -47,9 +48,25 @@ export async function startJoin({ link, dir, checksum, log }) {
         onDead: () => { log('host sem resposta — reconectando'); ws.terminate(); },
       });
       engine.attach(secure);
+
+      // PROVA DE POSSE DA CHAVE PELO HOST (autentica o host ao cliente).
+      //
+      // Hoje o cliente confia em qualquer host que o link aponte. Mas como o
+      // canal é AES-256-GCM AUTENTICADO, um frame que CHEGA DECIFRADO só pôde ser
+      // produzido por quem possui a chave — prova implícita via AEAD. O primeiro
+      // frame decifrado é o HELLO do HOST (enviado já no attach), então prova que
+      // o host tem a chave. Exigimos recebê-lo dentro de AUTH_TIMEOUT; senão é um
+      // host impostor (ou um endpoint que só conhece o token) e reconectamos.
+      authTimer = setTimeout(() => {
+        log('host não provou posse da chave — reconectando');
+        ws.terminate(); // cai em ws.on('close' -> detach + reconexão com backoff
+      }, authTimeoutMs);
+      authTimer.unref?.(); // não segura o event loop vivo só por causa do timer
+      secure.once('message', () => clearTimeout(authTimer)); // 1º frame decifrado = prova de posse
     });
 
     ws.on('close', async (code) => {
+      if (authTimer) { clearTimeout(authTimer); authTimer = null; } // evita timer pendente após desconexão normal
       if (stopKA) { stopKA(); stopKA = null; }
       if (secure) await engine.detach(secure); // só limpa se ainda for a conexão ativa
       if (stopped) return;

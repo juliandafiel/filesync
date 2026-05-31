@@ -54,6 +54,28 @@ test('2. la <= pd -> deleteLocal (delete vence)', () => {
   assert.deepEqual(r.send, []);
 });
 
+// --- Bug 1: tombstone de deleção offline carimbado no mtime da última versão ---
+// O lado que deletou offline propaga o DELETE com deletedAt = mtime da última
+// versão conhecida. Estes casos provam o efeito no LADO DO PEER (que recebe o
+// delete e roda a reconcile como caso 2 "local vivo & peer deletado").
+
+test('bug1 (a) tombstone == peer mtime (peer inalterado) -> empate => peer deleta', () => {
+  // O peer NÃO mexeu no arquivo: seu mtime local == mtime carimbado no tombstone.
+  // Caso 2: la (100) > pd (100) é FALSO (empate) => deleteLocal. A deleção propaga.
+  const r = reconcilePlan({ a: file(100, 'x') }, {}, {}, { a: 100 });
+  assert.deepEqual(r.deleteLocal, ['a']);
+  assert.deepEqual(r.send, []);
+});
+
+test('bug1 (b) tombstone < peer mtime (peer editou mais novo) -> caso 2 send => ressuscita', () => {
+  // O peer editou o arquivo DEPOIS da última versão conhecida: peer mtime (200)
+  // > tombstone (100). Caso 2: la (200) > pd (100) é VERDADEIRO => send: a edição
+  // mais nova vence e o arquivo é ressuscitado para o lado que deletou. Sem perda.
+  const r = reconcilePlan({ a: file(200, 'x') }, {}, {}, { a: 100 });
+  assert.deepEqual(r.send, ['a']);
+  assert.deepEqual(r.deleteLocal, []);
+});
+
 // --- Caso 3: local vivo & peer totalmente ausente ---
 
 test('3. local vivo & peer ausente -> send', () => {

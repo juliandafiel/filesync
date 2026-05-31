@@ -20,7 +20,7 @@ function tokenMatches(provided, expected) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-export async function startShare({ dir, port, noTunnel, checksum, log }) {
+export async function startShare({ dir, port, noTunnel, checksum, log, authTimeoutMs = 15000 }) {
   const ig = loadIgnore(dir);
   // Identidade estável: o mesmo token/key entre reinícios -> o link continua válido.
   const identity = loadOrCreateIdentity(dir);
@@ -111,7 +111,31 @@ export async function startShare({ dir, port, noTunnel, checksum, log }) {
     });
     log('peer conectado');
     engine.attach(secure);
+
+    // PROVA DE POSSE DA CHAVE (autenticação mútua plena).
+    //
+    // O gate de token (header) só prova que o peer conhece o TOKEN — que viaja no
+    // link e pode vazar. Um atacante que sabe o token mas NÃO a chave E2E pode
+    // ocupar a vaga única (busy) e simplesmente nunca enviar um frame válido,
+    // respondendo só ao keepalive (pong), segurando a vaga por DoS.
+    //
+    // Como o canal é AES-256-GCM AUTENTICADO, qualquer frame que CHEGA DECIFRADO
+    // (evento 'message' da SecureSocket com key != null) só pôde ter sido
+    // produzido por quem possui a chave — é prova implícita de posse via AEAD.
+    // Logo, exigimos receber ao menos UM frame decifrado dentro de AUTH_TIMEOUT.
+    // O peer legítimo envia o HELLO já no attach, então o frame chega em ~1 RTT,
+    // muito antes do timeout. No modo sem E2E (key=null) a SecureSocket é
+    // passthrough e 'message' dispara para qualquer frame — aqui o timer só
+    // garante liveness (o peer precisa, ainda assim, mandar algo cedo).
+    const authTimer = setTimeout(() => {
+      log(`peer não provou posse da chave em ${authTimeoutMs}ms — encerrando`);
+      rawWs.terminate(); // dispara rawWs.on('close' -> engine.detach + busy=false (libera a vaga)
+    }, authTimeoutMs);
+    authTimer.unref?.(); // não segura o event loop vivo só por causa do timer
+    secure.once('message', () => clearTimeout(authTimer)); // 1º frame decifrado = prova de posse
+
     rawWs.on('close', async () => {
+      clearTimeout(authTimer); // evita timer pendente após desconexão normal
       stopKA();
       log('peer desconectado — aguardando reconexão');
       await engine.detach(secure); // espera limpar ANTES de liberar a vaga

@@ -58,6 +58,9 @@ export async function sendFile(ws, absPath, rel, meta) {
   }
 
   ws.send(JSON.stringify({ type: MSG.FILE_END, transferId }));
+  // Retorna o transferId para o REMETENTE mapear este envio (this.inflight) e
+  // casar o ACK/NACK que o receptor devolver (ver sync-engine.js pushFile).
+  return transferId;
 }
 
 // Recebe transferências. O processamento de mensagens é SERIALIZADO por quem
@@ -67,8 +70,10 @@ export async function sendFile(ws, absPath, rel, meta) {
 export class TransferReceiver {
   constructor(dir, { onComplete, onReject, log } = {}) {
     this.dir = dir;
-    this.onComplete = onComplete; // (rel, meta) => void  (após gravar e validar)
-    this.onReject = onReject;     // (rel, motivo) => void
+    // transferId é repassado aos callbacks para o sync-engine sinalizar ACK/NACK
+    // ao remetente casando exatamente o envio que terminou (ver sync-engine.js).
+    this.onComplete = onComplete; // (rel, meta, transferId) => void  (após gravar e validar)
+    this.onReject = onReject;     // (rel, motivo, transferId) => void
     this.log = log || (() => {});
     this.active = new Map(); // transferId -> { rel, meta, tmpAbs, destAbs, stream, hash, bytes, error }
   }
@@ -145,7 +150,7 @@ export class TransferReceiver {
 
     // Transferência recusada por falta de espaço: nada gravado.
     if (t.skip) {
-      if (this.onReject) this.onReject(t.rel, 'sem espaço em disco');
+      if (this.onReject) this.onReject(t.rel, 'sem espaço em disco', transferId);
       return null;
     }
 
@@ -155,7 +160,7 @@ export class TransferReceiver {
     if (t.error) {
       await fsp.rm(t.tmpAbs, { force: true }).catch(() => {});
       this.log(`erro ao gravar ${t.rel}: ${t.error.message}`);
-      if (this.onReject) this.onReject(t.rel, 'erro de escrita');
+      if (this.onReject) this.onReject(t.rel, 'erro de escrita', transferId);
       return null;
     }
 
@@ -166,7 +171,7 @@ export class TransferReceiver {
     if (digest !== t.meta.hash || t.bytes !== t.meta.size) {
       await fsp.rm(t.tmpAbs, { force: true }).catch(() => {});
       this.log(`integridade falhou em ${t.rel} (hash/tamanho não conferem) — descartado`);
-      if (this.onReject) this.onReject(t.rel, 'hash/tamanho divergente');
+      if (this.onReject) this.onReject(t.rel, 'hash/tamanho divergente', transferId);
       return null;
     }
 
@@ -178,6 +183,9 @@ export class TransferReceiver {
       if (Math.floor(cur.mtimeMs) > t.meta.mtimeMs) {
         await fsp.rm(t.tmpAbs, { force: true }).catch(() => {});
         this.log(`mantido ${t.rel}: versão local é mais recente`);
+        // NACK persistente: o receptor tem versão mais nova legítima; o remetente
+        // NÃO deve reenviar (motivo não-recuperável). Ver handler em sync-engine.js.
+        if (this.onReject) this.onReject(t.rel, 'versão local mais nova', transferId);
         return null;
       }
     } catch { /* destino não existe: pode gravar */ }
@@ -191,12 +199,15 @@ export class TransferReceiver {
     } catch (e) {
       await fsp.rm(t.tmpAbs, { force: true }).catch(() => {});
       this.log(`falha ao finalizar ${t.rel}: ${e.message}`);
+      // Falha recuperável (corrida ao renomear): NACK p/ o remetente reenviar.
+      if (this.onReject) this.onReject(t.rel, 'erro de escrita', transferId);
       return null;
     }
     // Preserva o mtime para a regra "mais recente vence" fazer sentido.
     const mtime = new Date(t.meta.mtimeMs);
     await fsp.utimes(t.destAbs, mtime, mtime).catch(() => {});
-    if (this.onComplete) this.onComplete(t.rel, t.meta);
+    // SUCESSO: repassa o transferId para o sync-engine sinalizar ACK ao remetente.
+    if (this.onComplete) this.onComplete(t.rel, t.meta, transferId);
     return t.rel;
   }
 

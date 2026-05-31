@@ -8,8 +8,8 @@
   },
   "scripts": {
     "start": "node bin/cli.js",
-    "test:unit": "for t in reconcile state suppress crypto securesocket trash keepalive diskspace identity normalize delta daemon pathsafety echosuppress liverename dirsync deltatransport; do node test/unit-$t.mjs || exit 1; done && node test/unit.mjs",
-    "test:e2e": "node test/e2e.mjs && node test/e2e-offline.mjs && node test/e2e-secure.mjs && node test/e2e-dirs.mjs && node test/e2e-delta.mjs",
+    "test:unit": "for t in reconcile state suppress crypto securesocket trash keepalive diskspace identity normalize delta daemon pathsafety echosuppress liverename dirsync deltatransport acknack; do node test/unit-$t.mjs || exit 1; done && node test/unit.mjs",
+    "test:e2e": "node test/e2e.mjs && node test/e2e-offline.mjs && node test/e2e-secure.mjs && node test/e2e-dirs.mjs && node test/e2e-delta.mjs && node test/e2e-auth.mjs",
     "test": "npm run test:unit && npm run test:e2e"
   },
   "keywords": [
