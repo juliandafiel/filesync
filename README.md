@@ -148,9 +148,21 @@ edição, subpastas, deleção, ignore de `.git` e ausência de loop de eco.
   nova pode perder para uma mais antiga. (Mitigado: se o hash for igual, nada é
   sobrescrito.)
 - Symlinks são ignorados nesta versão.
-- O túnel padrão (`localtunnel`) usa um serviço público gratuito; para algo mais
-  robusto, dá para trocar o provider em `src/tunnel.js` (ex: `cloudflared`).
-  A criptografia E2E protege o conteúdo mesmo que o túnel seja não-confiável.
+- O túnel padrão (`localtunnel`) usa um serviço público gratuito. Alguns
+  firewalls corporativos bloqueiam o domínio `loca.lt` por categoria
+  ("anonymizer"); nesses casos use o **cloudflared** (`*.trycloudflare.com`),
+  que costuma passar. Instale o binário [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
+  e rode o `share` com a variável de ambiente:
+
+  ```bash
+  FILESYNC_TUNNEL=cloudflared filesync share /caminho/da/pasta --port 4000
+  # opcional, se o binário não estiver no PATH:
+  # CLOUDFLARED_BIN=/caminho/para/cloudflared
+  ```
+
+  Só o lado `share` precisa do binário; o `join` é só o link. A criptografia E2E
+  protege o conteúdo mesmo que o túnel seja não-confiável (inclusive sob proxy
+  com inspeção SSL — nesse caso o `join` pode precisar de `NODE_TLS_REJECT_UNAUTHORIZED=0`).
 - **Retomada de transferência interrompida** ainda não é feita no meio do arquivo:
   se a conexão cair durante um envio grande, ele recomeça do **zero**. Na
   reconciliação pós-queda o delta sync fica **desligado** de propósito (para
