@@ -143,8 +143,20 @@ export class SyncEngine {
   }
 
   startWatcher() {
+    // O fs.watch nativo (ReadDirectoryChangesW no Windows, inotify no Linux)
+    // às vezes não dispara — em Windows corporativo (antivírus interceptando),
+    // drives de rede/sincronizados ou alguns containers. Nesses casos as
+    // mudanças ao vivo não sobem mesmo com o sync inicial funcionando. Ligue o
+    // polling com FILESYNC_POLL=1 (mais CPU, mas detecta em qualquer ambiente).
+    const usePolling = ['1', 'true', 'yes'].includes(
+      String(process.env.FILESYNC_POLL || '').toLowerCase(),
+    );
+    if (usePolling) this.log('watcher em modo polling (FILESYNC_POLL)');
     this.watcher = chokidar.watch(this.dir, {
       ignoreInitial: true, // não dispara 'add' para o que já existe
+      usePolling,
+      interval: 400, // intervalo de polling de arquivos (ms)
+      binaryInterval: 700, // idem para binários
       awaitWriteFinish: { stabilityThreshold: 300, pollInterval: 100 },
       ignored: (p) => {
         const rel = path.relative(this.dir, p).split(path.sep).join('/');
