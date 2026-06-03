@@ -26,7 +26,14 @@ export async function startJoin({ link, dir, checksum, log, authTimeoutMs = 1500
   function connect() {
     if (stopped) return;
     const ws = new WebSocket(wsUrl, {
-      headers: token ? { 'x-filesync-token': token } : {},
+      headers: {
+        ...(token ? { 'x-filesync-token': token } : {}),
+        // localtunnel (loca.lt) mostra uma página de aviso ("Click to continue")
+        // para visitantes novos e responde 200 em vez de fazer o upgrade WS.
+        // Estes headers pulam o interstício e deixam o handshake chegar no host.
+        'Bypass-Tunnel-Reminder': 'true',
+        'User-Agent': 'filesync',
+      },
     });
     current = ws;
     let lastStatus = null; // statusCode de um handshake recusado
